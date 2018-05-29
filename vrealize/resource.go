@@ -396,7 +396,7 @@ func createResource(d *schema.ResourceData, meta interface{}) error {
 // This function updates the state of a vRA 7 Deployment when changes to a Terraform file are applied.
 // The update is performed on the Deployment using supported (day-2) actions.
 func updateResource(d *schema.ResourceData, meta interface{}) error {
-	//Get requester machine ID from schema.dataresource
+	//Get the ID of the catalog request that was used to provision this Deployment.
 	catalogItemRequestID := d.Id()
 	//Get client handle
 	client := meta.(*APIClient)
@@ -404,7 +404,7 @@ func updateResource(d *schema.ResourceData, meta interface{}) error {
 	//If any change made in resource_configuration.
 	if d.HasChange("resource_configuration") {
 		//Read resource template
-		resourceView, errTemplate := client.GetResourceViews(catalogItemRequestID)
+		GetDeploymentStateData, errTemplate := client.GetDeploymentState(catalogItemRequestID)
 		if errTemplate != nil {
 			return fmt.Errorf("Resource view failed to load:  %v", errTemplate)
 		}
@@ -417,14 +417,10 @@ func updateResource(d *schema.ResourceData, meta interface{}) error {
 		resourceConfiguration, _ := d.Get("resource_configuration").(map[string]interface{})
 
 		//Iterate over the resources in the deployment
-		for item := range resourceView.Content {
-			resourceMap := resourceView.Content[item].(map[string]interface{})
-			//If component is not empty
-			if resourceMap["Component"] != "Infrastructure.Virtual" {
+		for item := range GetDeploymentStateData.Content {
+			resourceMap := GetDeploymentStateData.Content[item].(map[string]interface{})
+			if resourceMap["resourceType"] == "Infrastructure.Virtual" {
 				resourceSpecificData := resourceMap["data"].(map[string]interface{})
-				if resourceSpecificData["Component"] == nil {
-					continue
-				}
 				resourceSpecificLinks := resourceMap["links"].([]interface{})
 				componentName := resourceSpecificData["Component"].(string)
 				var reconfigGetLink string
@@ -435,8 +431,7 @@ func updateResource(d *schema.ResourceData, meta interface{}) error {
 					if linkInterface["rel"] == reconfigGetLinkTitleRel {
 						//Get resource reconfiguration template link
 						reconfigGetLink = linkInterface["href"].(string)
-					}
-					if linkInterface["rel"] == reconfigPostLinkTitleRel {
+					} else if linkInterface["rel"] == reconfigPostLinkTitleRel {
 						//Get resourcce reconfiguration request post link
 						reconfigPostLink = linkInterface["href"].(string)
 					}
@@ -459,6 +454,7 @@ func updateResource(d *schema.ResourceData, meta interface{}) error {
 				if err != nil {
 					return err
 				}
+				configChanged := false
 				for configKey := range resourceConfiguration {
 					//compare resource list (resource_name) with user configuration fields
 					if strings.HasPrefix(configKey, componentName+".") {
@@ -468,7 +464,7 @@ func updateResource(d *schema.ResourceData, meta interface{}) error {
 						//actionResponseInterface := actionResponse.(map[string]interface{})
 						//Function call which changes the template field values with  user values
 						//Replace existing values with new values in resource child template
-						resourceAction.Data, _ = changeTemplateValue(
+						resourceAction.Data, configChanged = changeTemplateValue(
 							resourceAction.Data,
 							splitedArray[1],
 							resourceConfiguration[configKey])
@@ -478,21 +474,23 @@ func updateResource(d *schema.ResourceData, meta interface{}) error {
 					//delete(resourceConfiguration, configKey)
 				}
 				//If template value got changed then set post call and update resource child
-				resourceAction2 := new(ResourceActionTemplate)
-				apiError2 := new(APIError)
-				response2, _ := client.HTTPClient.New().Post(reconfigPostLink).
-					BodyJSON(resourceAction).Receive(resourceAction2, apiError2)
+				if configChanged != false {
+					resourceAction2 := new(ResourceActionTemplate)
+					apiError2 := new(APIError)
+					response2, _ := client.HTTPClient.New().Post(reconfigPostLink).
+						BodyJSON(resourceAction).Receive(resourceAction2, apiError2)
 
-				if response2.StatusCode != 201 {
-					oldData, _ := d.GetChange("resource_configuration")
-					d.Set("resource_configuration", oldData)
-					return apiError2
-				}
-				response2.Close = true
-				if !apiError2.isEmpty() {
-					oldData, _ := d.GetChange("resource_configuration")
-					d.Set("resource_configuration", oldData)
-					panic(d)
+					if response2.StatusCode != 201 {
+						oldData, _ := d.GetChange("resource_configuration")
+						d.Set("resource_configuration", oldData)
+						return apiError2
+					}
+					response2.Close = true
+					if !apiError2.isEmpty() {
+						oldData, _ := d.GetChange("resource_configuration")
+						d.Set("resource_configuration", oldData)
+						return apiError2
+					}
 				}
 			}
 		}
@@ -504,7 +502,7 @@ func updateResource(d *schema.ResourceData, meta interface{}) error {
 // This function retrieves the latest state of a vRA 7 deployment. Terraform updates its state based on
 // the information returned by this function.
 func readResource(d *schema.ResourceData, meta interface{}) error {
-	//Get requester machine ID from schema.dataresource
+	//Get the ID of the catalog request that was used to provision this Deployment.
 	catalogItemRequestID := d.Id()
 	//Get client handle
 	client := meta.(*APIClient)
@@ -522,7 +520,7 @@ func readResource(d *schema.ResourceData, meta interface{}) error {
 		d.Set("failed_message", resourceTemplate.RequestCompletion.CompletionDetails)
 	}
 
-	resourceView, errTemplate := client.GetResourceViews(catalogItemRequestID)
+	GetDeploymentStateData, errTemplate := client.GetDeploymentState(catalogItemRequestID)
 	if errTemplate != nil {
 		return fmt.Errorf("Resource view failed to load:  %v", errTemplate)
 	}
@@ -533,8 +531,8 @@ func readResource(d *schema.ResourceData, meta interface{}) error {
 	var childConfig map[string]interface{}
 	childConfig = map[string]interface{}{}
 
-	for item := range resourceView.Content {
-		resourceMap := resourceView.Content[item].(map[string]interface{})
+	for item := range GetDeploymentStateData.Content {
+		resourceMap := GetDeploymentStateData.Content[item].(map[string]interface{})
 		resourceSpecificData := resourceMap["data"].(map[string]interface{})
 		resourceSpecificLinks := resourceMap["links"].([]interface{})
 		if resourceSpecificData["Component"] != nil {
@@ -557,6 +555,9 @@ func readResource(d *schema.ResourceData, meta interface{}) error {
 				return apiError
 			}
 			if err != nil {
+				if err.Error() == "invalid character '<' looking for beginning of value" {
+					return fmt.Errorf("resource is not yet ready to show up")
+				}
 				return err
 			}
 			childConfig[componentName] = resourceAction.Data
@@ -647,7 +648,7 @@ func deleteResource(d *schema.ResourceData, meta interface{}) error {
 
 	}
 	//Fetch machine template
-	resourceView, errTemplate := client.GetResourceViews(catalogItemRequestID)
+	GetDeploymentStateData, errTemplate := client.GetDeploymentState(catalogItemRequestID)
 
 	if errTemplate != nil {
 		return fmt.Errorf("Resource view failed to load:  %v", errTemplate)
@@ -655,7 +656,7 @@ func deleteResource(d *schema.ResourceData, meta interface{}) error {
 
 	//Set a delete machine template function call.
 	//Which will fetch and return the delete machine template from the given template
-	DestroyMachineTemplate, resourceTemplate, errDestroyAction := client.GetDestroyActionTemplate(resourceView)
+	DestroyMachineTemplate, resourceTemplate, errDestroyAction := client.GetDestroyActionTemplate(GetDeploymentStateData)
 	if errDestroyAction != nil {
 		if errDestroyAction.Error() == "resource is not created or not found" {
 			d.SetId("")
@@ -755,11 +756,11 @@ func (c *APIClient) GetRequestStatus(ResourceID string) (*RequestStatusView, err
 	return RequestStatusViewTemplate, nil
 }
 
-//GetResourceViews - To read resource configuration
-func (c *APIClient) GetResourceViews(ResourceID string) (*ResourceView, error) {
+// GetDeploymentState - Read the state of a vRA7 Deployment
+func (c *APIClient) GetDeploymentState(CatalogRequestId string) (*ResourceView, error) {
 	//Form an URL to fetch resource list view
 	path := fmt.Sprintf("catalog-service/api/consumer/requests/%s"+
-		"/resourceViews", ResourceID)
+		"/resourceViews", CatalogRequestId)
 	ResourceView := new(ResourceView)
 	apiError := new(APIError)
 	//Set a REST call to fetch resource view data
